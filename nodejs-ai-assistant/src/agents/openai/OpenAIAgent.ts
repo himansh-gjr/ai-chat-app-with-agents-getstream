@@ -5,8 +5,6 @@ import { OpenAIResponseHandler } from "./OpenAIResponseHandler";
 
 export class OpenAIAgent implements AIAgent {
   private openai?: OpenAI;
-  private assistant?: OpenAI.Beta.Assistants.Assistant;
-  private openAiThread?: OpenAI.Beta.Threads.Thread;
   private lastInteractionTs = Date.now();
 
   private handlers: OpenAIResponseHandler[] = [];
@@ -14,7 +12,7 @@ export class OpenAIAgent implements AIAgent {
   constructor(
     readonly chatClient: StreamChat,
     readonly channel: Channel
-  ) {}
+  ) { }
 
   dispose = async () => {
     this.chatClient.off("message.new", this.handleMessage);
@@ -36,35 +34,10 @@ export class OpenAIAgent implements AIAgent {
       throw new Error("OpenAI API key is required");
     }
 
-    this.openai = new OpenAI({ apiKey });
-    this.assistant = await this.openai.beta.assistants.create({
-      name: "AI Writing Assistant",
-      instructions: this.getWritingAssistantPrompt(),
-      model: "gpt-4o",
-      tools: [
-        { type: "code_interpreter" },
-        {
-          type: "function",
-          function: {
-            name: "web_search",
-            description:
-              "Search the web for current information, news, facts, or research on any topic",
-            parameters: {
-              type: "object",
-              properties: {
-                query: {
-                  type: "string",
-                  description: "The search query to find information about",
-                },
-              },
-              required: ["query"],
-            },
-          },
-        },
-      ],
-      temperature: 0.7,
+    this.openai = new OpenAI({
+      apiKey,
+      baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
     });
-    this.openAiThread = await this.openai.beta.threads.create();
 
     this.chatClient.on("message.new", this.handleMessage);
   };
@@ -99,7 +72,7 @@ Your goal is to provide accurate, current, and helpful written content. Failure 
   };
 
   private handleMessage = async (e: Event<DefaultGenerics>) => {
-    if (!this.openai || !this.openAiThread || !this.assistant) {
+    if (!this.openai) {
       console.log("OpenAI not initialized");
       return;
     }
@@ -118,10 +91,11 @@ Your goal is to provide accurate, current, and helpful written content. Failure 
     const context = writingTask ? `Writing Task: ${writingTask}` : undefined;
     const instructions = this.getWritingAssistantPrompt(context);
 
-    await this.openai.beta.threads.messages.create(this.openAiThread.id, {
-      role: "user",
-      content: message,
-    });
+    // V1: System prompt + current user message, no conversation history
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+      { role: "system", content: instructions },
+      { role: "user", content: message },
+    ];
 
     const { message: channelMessage } = await this.channel.sendMessage({
       text: "",
@@ -135,17 +109,10 @@ Your goal is to provide accurate, current, and helpful written content. Failure 
       message_id: channelMessage.id,
     });
 
-    const run = this.openai.beta.threads.runs.createAndStream(
-      this.openAiThread.id,
-      {
-        assistant_id: this.assistant.id,
-      }
-    );
-
     const handler = new OpenAIResponseHandler(
       this.openai,
-      this.openAiThread,
-      run,
+      messages,
+      "gemini-3.5-flash",
       this.chatClient,
       this.channel,
       channelMessage,

@@ -1,18 +1,16 @@
 import OpenAI from "openai";
-import type { AssistantStream } from "openai/lib/AssistantStream";
 import type { Channel, Event, MessageResponse, StreamChat } from "stream-chat";
 
 export class OpenAIResponseHandler {
   private message_text = "";
-  private chunk_counter = 0;
-  private run_id = "";
   private is_done = false;
   private last_update_time = 0;
+  private abortController = new AbortController();
 
   constructor(
     private readonly openai: OpenAI,
-    private readonly openAiThread: OpenAI.Beta.Threads.Thread,
-    private readonly assistantStream: AssistantStream,
+    private readonly messages: OpenAI.Chat.ChatCompletionMessageParam[],
+    private readonly model: string,
     private readonly chatClient: StreamChat,
     private readonly channel: Channel,
     private readonly message: MessageResponse,
@@ -24,84 +22,172 @@ export class OpenAIResponseHandler {
   run = async () => {
     const { cid, id: message_id } = this.message;
     let isCompleted = false;
-    let toolOutputs = [];
-    let currentStream: AssistantStream = this.assistantStream;
+
+    const tools: OpenAI.Chat.ChatCompletionTool[] = [
+      {
+        type: "function",
+        function: {
+          name: "web_search",
+          description:
+            "Search the web for current information, news, facts, or research on any topic",
+          parameters: {
+            type: "object",
+            properties: {
+              query: {
+                type: "string",
+                description: "The search query to find information about",
+              },
+            },
+            required: ["query"],
+          },
+        },
+      },
+    ];
 
     try {
-      while (!isCompleted) {
-        for await (const event of currentStream) {
-          this.handleStreamEvent(event);
+      while (!isCompleted && !this.is_done) {
+        await this.channel.sendEvent({
+          type: "ai_indicator.update",
+          ai_state: "AI_STATE_GENERATING",
+          cid: cid,
+          message_id: message_id,
+        });
 
-          if (
-            event.event === "thread.run.requires_action" &&
-            event.data.required_action?.type === "submit_tool_outputs"
-          ) {
-            this.run_id = event.data.id;
-            await this.channel.sendEvent({
-              type: "ai_indicator.update",
-              ai_state: "AI_STATE_EXTERNAL_SOURCES",
-              cid: cid,
-              message_id: message_id,
-            });
-            const toolCalls =
-              event.data.required_action.submit_tool_outputs.tool_calls;
-            toolOutputs = [];
+        const stream = await this.openai.chat.completions.create(
+          {
+            model: this.model,
+            messages: this.messages,
+            stream: true,
+            tools: tools,
+            temperature: 0.7,
+          },
+          { signal: this.abortController.signal }
+        );
 
-            for (const toolCall of toolCalls) {
-              if (toolCall.function.name === "web_search") {
-                try {
-                  const args = JSON.parse(toolCall.function.arguments);
-                  const searchResult = await this.performWebSearch(args.query);
-                  toolOutputs.push({
-                    tool_call_id: toolCall.id,
-                    output: searchResult,
-                  });
-                } catch (e) {
-                  console.error(
-                    "Error parsing tool arguments or performing web search",
-                    e
-                  );
-                  toolOutputs.push({
-                    tool_call_id: toolCall.id,
-                    output: JSON.stringify({ error: "failed to call tool" }),
-                  });
-                }
+        let toolCallsAccumulator: any[] = [];
+        let hasContent = false;
+
+        for await (const chunk of stream) {
+          if (this.is_done) break;
+
+          const delta = chunk.choices[0]?.delta;
+          if (delta?.content) {
+            hasContent = true;
+            this.message_text += delta.content;
+            const now = Date.now();
+            if (now - this.last_update_time > 1000) {
+              await this.chatClient.partialUpdateMessage(message_id, {
+                set: { text: this.message_text },
+              });
+              this.last_update_time = now;
+            }
+          }
+
+          if (delta?.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              if (tc.index === undefined) continue;
+              if (!toolCallsAccumulator[tc.index]) {
+                toolCallsAccumulator[tc.index] = {
+                  id: tc.id || "",
+                  type: "function",
+                  function: { name: tc.function?.name || "", arguments: "" },
+                };
+              }
+              if (tc.id) {
+                toolCallsAccumulator[tc.index].id = tc.id;
+              }
+              if (tc.function?.name) {
+                toolCallsAccumulator[tc.index].function.name = tc.function.name;
+              }
+              if (tc.function?.arguments) {
+                toolCallsAccumulator[tc.index].function.arguments +=
+                  tc.function.arguments;
               }
             }
-            // Exit the inner loop to submit tool outputs
-            break;
-          }
-
-          if (event.event === "thread.run.completed") {
-            isCompleted = true;
-            break; // Exit the inner loop
-          }
-
-          if (event.event === "thread.run.failed") {
-            isCompleted = true;
-            await this.handleError(
-              new Error(event.data.last_error?.message ?? "Run failed")
-            );
-            break; // Exit the inner loop
           }
         }
 
-        if (isCompleted) {
-          break; // Exit the while loop
-        }
+        if (this.is_done) break;
 
-        if (toolOutputs.length > 0) {
-          currentStream = this.openai.beta.threads.runs.submitToolOutputsStream(
-            this.openAiThread.id,
-            this.run_id,
-            { tool_outputs: toolOutputs }
-          );
-          toolOutputs = []; // Reset tool outputs
+        // Clean up undefined elements from accumulator if any
+        const toolCalls = toolCallsAccumulator.filter(Boolean);
+
+        if (toolCalls.length > 0) {
+          // Push tool request message
+          this.messages.push({
+            role: "assistant",
+            content: null,
+            tool_calls: toolCalls.map((tc) => ({
+              id: tc.id,
+              type: "function",
+              function: {
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+              },
+            })),
+          });
+
+          await this.channel.sendEvent({
+            type: "ai_indicator.update",
+            ai_state: "AI_STATE_EXTERNAL_SOURCES",
+            cid: cid,
+            message_id: message_id,
+          });
+
+          for (const toolCall of toolCalls) {
+            if (toolCall.function.name === "web_search") {
+              try {
+                const args = JSON.parse(toolCall.function.arguments);
+                const searchResult = await this.performWebSearch(args.query);
+                this.messages.push({
+                  role: "tool",
+                  tool_call_id: toolCall.id,
+                  content: searchResult,
+                });
+              } catch (e) {
+                console.error(
+                  "Error parsing tool arguments or performing web search",
+                  e
+                );
+                this.messages.push({
+                  role: "tool",
+                  tool_call_id: toolCall.id,
+                  content: JSON.stringify({ error: "failed to call tool" }),
+                });
+              }
+            } else {
+              this.messages.push({
+                role: "tool",
+                tool_call_id: toolCall.id,
+                content: JSON.stringify({ error: "unknown tool" }),
+              });
+            }
+          }
+        } else {
+          isCompleted = true;
         }
       }
+
+      if (!this.is_done) {
+        await this.chatClient.partialUpdateMessage(message_id, {
+          set: { text: this.message_text },
+        });
+        await this.channel.sendEvent({
+          type: "ai_indicator.clear",
+          cid: cid,
+          message_id: message_id,
+        });
+      }
     } catch (error) {
-      console.error("An error occurred during the run:", error);
-      await this.handleError(error as Error);
+      if (
+        error instanceof Error &&
+        (error.name === "AbortError" || error.message.includes("abort"))
+      ) {
+        console.log("Stream generation aborted successfully");
+      } else {
+        console.error("An error occurred during the run:", error);
+        await this.handleError(error as Error);
+      }
     } finally {
       await this.dispose();
     }
@@ -122,18 +208,7 @@ export class OpenAIResponseHandler {
     }
 
     console.log("Stop generating for message", this.message.id);
-    if (!this.openai || !this.openAiThread || !this.run_id) {
-      return;
-    }
-
-    try {
-      await this.openai.beta.threads.runs.cancel(
-        this.openAiThread.id,
-        this.run_id
-      );
-    } catch (e) {
-      console.error("Error cancelling run", e);
-    }
+    this.abortController.abort();
 
     await this.channel.sendEvent({
       type: "ai_indicator.clear",
@@ -141,52 +216,6 @@ export class OpenAIResponseHandler {
       message_id: this.message.id,
     });
     await this.dispose();
-  };
-
-  private handleStreamEvent = (
-    event: OpenAI.Beta.Assistants.AssistantStreamEvent
-  ) => {
-    const { cid, id } = this.message;
-
-    if (event.event === "thread.run.created") {
-      this.run_id = event.data.id;
-    } else if (event.event === "thread.message.delta") {
-      const textDelta = event.data.delta.content?.[0];
-      if (textDelta?.type === "text" && textDelta.text) {
-        this.message_text += textDelta.text.value || "";
-        const now = Date.now();
-        if (now - this.last_update_time > 1000) {
-          this.chatClient.partialUpdateMessage(id, {
-            set: { text: this.message_text },
-          });
-          this.last_update_time = now;
-        }
-        this.chunk_counter += 1;
-      }
-    } else if (event.event === "thread.message.completed") {
-      this.chatClient.partialUpdateMessage(id, {
-        set: {
-          text:
-            event.data.content[0].type === "text"
-              ? event.data.content[0].text.value
-              : this.message_text,
-        },
-      });
-      this.channel.sendEvent({
-        type: "ai_indicator.clear",
-        cid: cid,
-        message_id: id,
-      });
-    } else if (event.event === "thread.run.step.created") {
-      if (event.data.step_details.type === "message_creation") {
-        this.channel.sendEvent({
-          type: "ai_indicator.update",
-          ai_state: "AI_STATE_GENERATING",
-          cid: cid,
-          message_id: id,
-        });
-      }
-    }
   };
 
   private handleError = async (error: Error) => {

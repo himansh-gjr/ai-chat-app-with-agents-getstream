@@ -43,6 +43,8 @@ app.post("/start-ai-agent", async (req, res) => {
   const { channel_id, channel_type = "messaging" } = req.body;
   console.log(`[API] /start-ai-agent called for channel: ${channel_id}`);
 
+  console.log("req body", req.body)
+
   // Simple validation
   if (!channel_id) {
     res.status(400).json({ error: "Missing required fields" });
@@ -65,6 +67,8 @@ app.post("/start-ai-agent", async (req, res) => {
       const channel = serverClient.channel(channel_type, channel_id);
       await channel.addMembers([user_id]);
 
+      console.log("everything before creating agent wokring fine =======================================================")
+
       const agent = await createAgent(
         user_id,
         AgentPlatform.OPENAI,
@@ -86,6 +90,7 @@ app.post("/start-ai-agent", async (req, res) => {
 
     res.json({ message: "AI Agent started", data: [] });
   } catch (error) {
+    console.log("error", error)
     const errorMessage = (error as Error).message;
     console.error("Failed to start AI Agent", errorMessage);
     res
