@@ -7,7 +7,23 @@ import { apiKey, serverClient } from "./serverClient";
 
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: "*" }));
+
+const renderFrontendPattern = /^https:\/\/ai-chat-frontend(-[a-z0-9]+)?\.onrender\.com$/;
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (
+        !origin ||
+        origin === process.env.FRONTEND_URL ||
+        renderFrontendPattern.test(origin)
+      ) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+  })
+);
 
 // Map to store the AI Agent instances
 // [user_id string]: AI Agent
